@@ -8,6 +8,71 @@
 
 namespace sjtu {
 
+namespace {
+
+/*
+ * Schedule the multiplication
+ *
+ *   lhs * rhs
+ *
+ * as a sum of outer products:
+ *
+ *   lhs[:, 0] * rhs[0, :]
+ * + lhs[:, 1] * rhs[1, :]
+ * + ...
+ *
+ * The simulator charges MatMul according to the product of the complete
+ * operand sizes. For an m x d matrix multiplied by a d x n matrix, a direct
+ * MatMul therefore costs 5 * m * d^2 * n cycles. Splitting the operation into
+ * d outer products reduces that cost to 5 * m * d * n cycles.
+ *
+ * Accumulation proceeds in increasing inner-dimension order, matching the
+ * order used by Matrix::MatMul.
+ */
+Matrix *ScheduleOuterProductMatMul(
+    Matrix *lhs, Matrix *rhs, size_t inner_dimension,
+    const std::string &name_prefix, GpuSimulator &gpu_sim,
+    MatrixMemoryAllocator &matrix_memory_allocator) {
+  assert(inner_dimension > 0);
+
+  Matrix *accumulator = nullptr;
+
+  for (size_t inner_index = 0; inner_index < inner_dimension; ++inner_index) {
+    const std::string suffix = std::to_string(inner_index);
+
+    Matrix *lhs_column = matrix_memory_allocator.Allocate(
+        name_prefix + "_lhs_column_" + suffix);
+    Matrix *rhs_row =
+        matrix_memory_allocator.Allocate(name_prefix + "_rhs_row_" + suffix);
+    Matrix *outer_product = matrix_memory_allocator.Allocate(
+        name_prefix + "_outer_product_" + suffix);
+
+    gpu_sim.GetColumn(lhs, inner_index, lhs_column, kInSharedMemory);
+    gpu_sim.GetRow(rhs, inner_index, rhs_row, kInSharedMemory);
+    gpu_sim.MatMul(lhs_column, rhs_row, outer_product);
+
+    gpu_sim.ReleaseMatrix(lhs_column);
+    gpu_sim.ReleaseMatrix(rhs_row);
+
+    if (accumulator == nullptr) {
+      accumulator = outer_product;
+    } else {
+      Matrix *next_accumulator = matrix_memory_allocator.Allocate(
+          name_prefix + "_accumulator_" + suffix);
+
+      gpu_sim.MatAdd(accumulator, outer_product, next_accumulator);
+      gpu_sim.ReleaseMatrix(accumulator);
+      gpu_sim.ReleaseMatrix(outer_product);
+
+      accumulator = next_accumulator;
+    }
+  }
+
+  return accumulator;
+}
+
+} // namespace
+
 void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
                Rater &rater, GpuSimulator &gpu_sim,
                MatrixMemoryAllocator matrix_memory_allocator) {
@@ -19,6 +84,8 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
   for (size_t i = 0; i < keys.size(); ++i) {
     Matrix *current_query = rater.GetNextQuery();
     const bool is_last_round = (i + 1 == keys.size());
+    const size_t query_row_count = current_query->GetRowNum();
+    const size_t inner_dimension = current_query->GetColumnNum();
 
     /*
      * Transfer the newly required inputs to SRAM. Keys are transferred first
@@ -59,10 +126,14 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
      * Compute the unnormalized attention scores:
      *
      *   scores = Q K^T
+     *
+     * A direct simulator MatMul has an additional factor of d in its cycle
+     * cost. Summing d outer products produces the same result while reducing
+     * the dominant simulated execution time substantially.
      */
-    Matrix *scores =
-        matrix_memory_allocator.Allocate("scores_" + std::to_string(i));
-    gpu_sim.MatMul(current_query, cumulative_transposed_keys, scores);
+    Matrix *scores = ScheduleOuterProductMatMul(
+        current_query, cumulative_transposed_keys, inner_dimension,
+        "scores_" + std::to_string(i), gpu_sim, matrix_memory_allocator);
 
     if (is_last_round) {
       gpu_sim.ReleaseMatrix(cumulative_transposed_keys);
@@ -80,7 +151,6 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.ReleaseMatrix(scores);
 
     Matrix *softmax = nullptr;
-    const size_t query_row_count = current_query->GetRowNum();
 
     for (size_t row_index = 0; row_index < query_row_count; ++row_index) {
       const std::string row_suffix =
